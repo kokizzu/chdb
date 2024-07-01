@@ -1,4 +1,5 @@
 #include <Interpreters/Context.h>
+#include <Interpreters/InterpreterFactory.h>
 #include <Interpreters/InterpreterSetQuery.h>
 #include <Parsers/ASTSelectQuery.h>
 #include <Parsers/ASTSetQuery.h>
@@ -8,6 +9,7 @@
 #include <Parsers/ASTQueryWithOutput.h>
 #include <Parsers/ASTSelectWithUnionQuery.h>
 
+#include <filesystem>
 #include <fstream>
 
 namespace DB
@@ -24,12 +26,12 @@ BlockIO InterpreterSetQuery::execute()
     getContext()->checkSettingsConstraints(ast.changes, SettingSource::QUERY);
     auto session_context = getContext()->getSessionContext();
     session_context->applySettingsChanges(ast.changes);
-    session_context->addQueryParameters(ast.query_parameters);
+    session_context->addQueryParameters(NameToNameMap{ast.query_parameters.begin(), ast.query_parameters.end()});
     session_context->resetSettingsToDefaultValue(ast.default_settings);
 
     // Define the path for the file where SET statements will be logged. Assuming `getContext()->getPath()`
     // provides a base directory suitable for such logs.
-    auto set_statements_path = fs::path(getContext()->getPath()) / "set_statements";
+    auto set_statements_path = std::filesystem::path(getContext()->getPath()) / "set_statements";
     // Open the log file in append mode. If the file doesn't exist, it will be created.
     std::ofstream set_statements_fs(set_statements_path, std::ofstream::out | std::ofstream::app);
     if (!set_statements_fs.is_open())
@@ -116,4 +118,12 @@ void InterpreterSetQuery::applySettingsFromQuery(const ASTPtr & ast, ContextMuta
     }
 }
 
+void registerInterpreterSetQuery(InterpreterFactory & factory)
+{
+    auto create_fn = [] (const InterpreterFactory::Arguments & args)
+    {
+        return std::make_unique<InterpreterSetQuery>(args.query, args.context);
+    };
+    factory.registerInterpreter("InterpreterSetQuery", create_fn);
+}
 }

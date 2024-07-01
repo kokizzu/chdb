@@ -18,14 +18,14 @@ if [ ! -d ${PROJ_DIR}/python_pkg ]; then
     mkdir ${PROJ_DIR}/python_pkg
 fi
 
-# prefer /usr/local/opt/llvm@17/bin/clang++ then /usr/local/opt/llvm/bin/clang++
-if [ -f /usr/local/opt/llvm@17/bin/clang++ ]; then
-    export CXX=/usr/local/opt/llvm@17/bin/clang++
+# prefer /usr/local/opt/llvm@18/bin/clang++ then /usr/local/opt/llvm/bin/clang++
+if [ -f /usr/local/opt/llvm@18/bin/clang++ ]; then
+    export CXX=/usr/local/opt/llvm@18/bin/clang++
 elif [ -f /usr/local/opt/llvm/bin/clang++ ]; then
     export CXX=/usr/local/opt/llvm/bin/clang++
 fi
-if [ -f /usr/local/opt/llvm@17/bin/clang ]; then
-    export CC=/usr/local/opt/llvm@17/bin/clang
+if [ -f /usr/local/opt/llvm@18/bin/clang ]; then
+    export CC=/usr/local/opt/llvm@18/bin/clang
 elif [ -f /usr/local/opt/llvm/bin/clang ]; then
     export CC=/usr/local/opt/llvm/bin/clang
 fi
@@ -73,7 +73,7 @@ for PY_VER in 3.9.13 3.10.11 3.11.3 3.12.0; do
         exit 1
     fi
 
-    python3 -m pip install -U pybind11 wheel build tox psutil setuptools pyarrow pandas
+    python3 -m pip install -U pybind11 wheel build tox psutil setuptools pyarrow pandas certifi
     rm -rf ${PROJ_DIR}/buildlib
 
     ${PROJ_DIR}/chdb/build.sh

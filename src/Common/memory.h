@@ -256,7 +256,7 @@ inline ALWAYS_INLINE size_t untrackMemory(void * ptr [[maybe_unused]], Allocatio
 #endif
         trace = CurrentMemoryTracker::free(actual_size);
     }
-    catch (...)
+    catch (...) /// NOLINT(bugprone-empty-catch)
     {
     }
 

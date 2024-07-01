@@ -1,3 +1,5 @@
+add_compile_options($<$<OR:$<COMPILE_LANGUAGE:C>,$<COMPILE_LANGUAGE:CXX>>:${COVERAGE_FLAGS}>)
+
 if (USE_INCLUDE_WHAT_YOU_USE)
     set (CMAKE_CXX_INCLUDE_WHAT_YOU_USE ${IWYU_PATH})
 endif ()
@@ -7,7 +9,7 @@ if (USE_CLANG_TIDY)
 endif ()
 
 if(COMPILER_PIPE)
-    set(MAX_COMPILER_MEMORY 2500)
+    set(MAX_COMPILER_MEMORY 600)
 else()
     set(MAX_COMPILER_MEMORY 1500)
 endif()
@@ -18,7 +20,6 @@ include (../cmake/version.cmake)
 message (STATUS "Will build ${VERSION_FULL} revision ${VERSION_REVISION} ${VERSION_OFFICIAL}")
 include (configure_config.cmake)
 configure_file (Common/config.h.in ${CONFIG_INCLUDE_PATH}/config.h)
-configure_file (Common/config_version.h.in ${CONFIG_INCLUDE_PATH}/config_version.h)
 configure_file (Common/config_version.cpp.in ${CONFIG_INCLUDE_PATH}/config_version.cpp)
 
 if (USE_DEBUG_HELPERS)
@@ -82,12 +83,23 @@ add_subdirectory (Formats)
 
 add_headers_and_sources(clickhouse_common_io Common)
 add_headers_and_sources(clickhouse_common_io Common/HashTable)
-add_headers_and_sources(clickhouse_common_io Common/SSH)
+add_headers_and_sources(clickhouse_common_io Common/Scheduler)
+add_headers_and_sources(clickhouse_common_io Common/Scheduler/Nodes)
 add_headers_and_sources(clickhouse_common_io IO)
 add_headers_and_sources(clickhouse_common_io IO/Archives)
-add_headers_and_sources(clickhouse_common_io IO/Resource)
 add_headers_and_sources(clickhouse_common_io IO/S3)
+add_headers_and_sources(clickhouse_common_io IO/AzureBlobStorage)
 list (REMOVE_ITEM clickhouse_common_io_sources Common/malloc.cpp Common/mallocAdapt.c Common/stubFree.c Common/new_delete.cpp)
+
+
+add_headers_and_sources(clickhouse_compression Compression)
+add_headers_and_sources(clickhouse_compression Parsers)
+add_headers_and_sources(clickhouse_compression Core)
+#Included these specific files to avoid linking grpc
+add_glob(clickhouse_compression_headers Server/ServerType.h)
+add_glob(clickhouse_compression_sources Server/ServerType.cpp)
+add_library(clickhouse_compression ${clickhouse_compression_headers} ${clickhouse_compression_sources})
+
 
 add_headers_and_sources(dbms Disks/IO)
 add_headers_and_sources(dbms Disks/ObjectStorages)
@@ -128,6 +140,7 @@ endif()
 
 if (TARGET ch_contrib::azure_sdk)
     add_headers_and_sources(dbms Disks/ObjectStorages/AzureBlobStorage)
+    add_headers_and_sources(dbms IO/AzureBlobStorage)
 endif()
 
 if (TARGET ch_contrib::hdfs)
@@ -159,10 +172,12 @@ endif ()
 
 add_library(clickhouse_common_io ${clickhouse_common_io_headers} ${clickhouse_common_io_sources})
 
+set_source_files_properties(Common/ThreadFuzzer.cpp PROPERTIES COMPILE_FLAGS "-fomit-frame-pointer -momit-leaf-frame-pointer")
+
 if (SPLIT_SHARED_LIBRARIES)
     target_compile_definitions(clickhouse_common_io PRIVATE SPLIT_SHARED_LIBRARIES)
 endif ()
-
+    
 if (ENABLE_JEMALLOC)
     add_library (clickhouse_malloc OBJECT Common/mallocAdapt.c Common/stubFree.c Common/malloc.cpp)
     set_source_files_properties(Common/mallocAdapt.c PROPERTIES COMPILE_FLAGS "-DJEMALLOC_NO_RENAME")
@@ -229,9 +244,11 @@ add_object_library(clickhouse_storages Storages)
 add_object_library(clickhouse_storages_mysql Storages/MySQL)
 add_object_library(clickhouse_storages_distributed Storages/Distributed)
 add_object_library(clickhouse_storages_mergetree Storages/MergeTree)
+add_object_library(clickhouse_storages_statistics Storages/Statistics)
 add_object_library(clickhouse_storages_liveview Storages/LiveView)
 add_object_library(clickhouse_storages_windowview Storages/WindowView)
 add_object_library(clickhouse_storages_s3queue Storages/S3Queue)
+add_object_library(clickhouse_storages_materializedview Storages/MaterializedView)
 add_object_library(clickhouse_client Client)
 add_object_library(clickhouse_bridge BridgeHelper)
 add_object_library(clickhouse_server Server)
@@ -264,6 +281,85 @@ target_link_libraries (dbms PRIVATE ch_contrib::libdivide)
 if (TARGET ch_contrib::jemalloc)
     target_link_libraries (dbms PRIVATE ch_contrib::jemalloc)
 endif()
+
+if (USE_PYTHON)
+    # Include path from shell cmd "python3 -m pybind11 --includes"
+    execute_process(COMMAND python3 -m pybind11 --includes
+        OUTPUT_VARIABLE PYBIND11_INCLUDES
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+
+    # Extract and set include directories specifically for source using pybind11
+    string(REGEX MATCHALL "-I([^ ]+)" INCLUDE_DIRS_MATCHES ${PYBIND11_INCLUDES})
+    set(PYTHON_INCLUDE_DIRS "")
+    foreach(INCLUDE_DIR_MATCH ${INCLUDE_DIRS_MATCHES})
+        string(REGEX REPLACE "-I" "" INCLUDE_DIR_MATCH ${INCLUDE_DIR_MATCH})
+        # Accumulate all include directories
+        set(PYTHON_INCLUDE_DIRS "${PYTHON_INCLUDE_DIRS};${INCLUDE_DIR_MATCH}")
+    endforeach()
+
+    # Apply the include directories to Storages/StoragePython.cpp and Processors/Sources/PythonSource.cpp
+    set_source_files_properties(Storages/StoragePython.cpp PROPERTIES INCLUDE_DIRECTORIES "${PYTHON_INCLUDE_DIRS}")
+    set_source_files_properties(Processors/Sources/PythonSource.cpp PROPERTIES INCLUDE_DIRECTORIES "${PYTHON_INCLUDE_DIRS}")
+    set_source_files_properties(Columns/ColumnPyObject.cpp PROPERTIES INCLUDE_DIRECTORIES "${PYTHON_INCLUDE_DIRS}")
+    set_source_files_properties(Common/PythonUtils.cpp PROPERTIES INCLUDE_DIRECTORIES "${PYTHON_INCLUDE_DIRS}")
+
+    # get python version, something like python3.x
+    execute_process(COMMAND python3 -c "import sys; print('python3.'+str(sys.version_info[1]))"
+        OUTPUT_VARIABLE PYTHON_VERSION
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+
+    # remove all warning, because pybind11 will generate a lot of warning
+    if (OS_LINUX)
+        # pybind11 will try to find x86_64-linux-gnu/${PYTHON_VERSION}/pyconfig.h
+        # use -idirafter to make it find the right one and not polute the include path
+        # set_source_files_properties(Storages/StoragePython.cpp PROPERTIES COMPILE_FLAGS
+        #     "-w -idirafter /usr/include -include x86_64-linux-gnu/${PYTHON_VERSION}/pyconfig.h"
+        # )
+        if (PYTHON_VERSION STREQUAL "python3.6" OR PYTHON_VERSION STREQUAL "python3.7" OR PYTHON_VERSION STREQUAL "python3.8")
+            set_source_files_properties(Storages/StoragePython.cpp PROPERTIES COMPILE_FLAGS
+                "-w -idirafter /usr/include -include crypt.h"
+            )
+            set_source_files_properties(Processors/Sources/PythonSource.cpp PROPERTIES COMPILE_FLAGS
+                "-w -idirafter /usr/include -include crypt.h"
+            )
+            set_source_files_properties(Columns/ColumnPyObject.cpp PROPERTIES COMPILE_FLAGS
+                "-w -idirafter /usr/include -include crypt.h"
+            )
+            set_source_files_properties(Common/PythonUtils.cpp PROPERTIES COMPILE_FLAGS
+                "-w -idirafter /usr/include -include crypt.h"
+            )
+        else()
+            set_source_files_properties(Storages/StoragePython.cpp PROPERTIES COMPILE_FLAGS
+                "-w"
+            )
+            set_source_files_properties(Processors/Sources/PythonSource.cpp PROPERTIES COMPILE_FLAGS
+                "-w"
+            )
+            set_source_files_properties(Columns/ColumnPyObject.cpp PROPERTIES COMPILE_FLAGS
+                "-w"
+            )
+            set_source_files_properties(Common/PythonUtils.cpp PROPERTIES COMPILE_FLAGS
+                "-w"
+            )
+        endif()
+    elseif (OS_DARWIN)
+        set_source_files_properties(Storages/StoragePython.cpp PROPERTIES COMPILE_FLAGS 
+            "-w"
+        )
+        set_source_files_properties(Processors/Sources/PythonSource.cpp PROPERTIES COMPILE_FLAGS 
+            "-w"
+        )
+        set_source_files_properties(Columns/ColumnPyObject.cpp PROPERTIES COMPILE_FLAGS 
+            "-w"
+        )
+        set_source_files_properties(Common/PythonUtils.cpp PROPERTIES COMPILE_FLAGS 
+            "-w"
+        )
+    endif()
+endif()
+
 set (all_modules dbms)
 
 macro (dbms_target_include_directories)
@@ -289,6 +385,7 @@ target_include_directories (clickhouse_common_io PUBLIC "${ClickHouse_SOURCE_DIR
 
 if (TARGET ch_contrib::llvm)
     dbms_target_link_libraries (PUBLIC ch_contrib::llvm)
+    target_link_libraries (clickhouse_compression PUBLIC ch_contrib::llvm)
 endif ()
 
 if (TARGET ch_contrib::gwp_asan)
@@ -297,21 +394,34 @@ if (TARGET ch_contrib::gwp_asan)
 endif()
 
 # Otherwise it will slow down stack traces printing too much.
-set_source_files_properties(
-        Common/Elf.cpp
-        Common/Dwarf.cpp
-        Common/SymbolIndex.cpp
-        PROPERTIES COMPILE_FLAGS "-O2 ${WITHOUT_COVERAGE}")
+if ("${CMAKE_BUILD_TYPE_UC}" STREQUAL "DEBUG")
+    set_source_files_properties(
+            Common/Elf.cpp
+            Common/Dwarf.cpp
+            Common/SymbolIndex.cpp
+            Common/ThreadFuzzer.cpp
+            PROPERTIES COMPILE_FLAGS "-O2 ${WITHOUT_COVERAGE_FLAGS}")
+endif()
 
 target_link_libraries (clickhouse_common_io
         PRIVATE
-            string_utils
             widechar_width
             ${LINK_LIBRARIES_ONLY_ON_X86_64}
         PUBLIC
             common
             ch_contrib::double_conversion
             ch_contrib::dragonbox_to_chars
+            ch_contrib::libdivide
+)
+
+
+target_link_libraries (clickhouse_compression
+        PUBLIC
+            pcg_random
+            clickhouse_parsers
+        PRIVATE
+            ch_contrib::lz4
+            ch_contrib::roaring
 )
 
 # Use X86 AVX2/AVX512 instructions to accelerate filter operations
@@ -354,7 +464,7 @@ if (TARGET ch_contrib::crc32-vpmsum)
  endif()
 
 if (TARGET ch_contrib::ssh)
- target_link_libraries(clickhouse_common_io PUBLIC ch_contrib::ssh)
+    target_link_libraries(clickhouse_common_io PUBLIC ch_contrib::ssh)
 endif()
 
 dbms_target_link_libraries(PUBLIC ch_contrib::abseil_swiss_tables)
@@ -378,10 +488,12 @@ endif()
 
 if (TARGET ch_contrib::krb5)
     dbms_target_link_libraries(PRIVATE ch_contrib::krb5)
+    target_link_libraries (clickhouse_compression PRIVATE ch_contrib::krb5)
 endif()
 
 if (TARGET ch_contrib::nuraft)
     dbms_target_link_libraries(PUBLIC ch_contrib::nuraft)
+    target_link_libraries (clickhouse_compression PUBLIC ch_contrib::nuraft)
 endif()
 
 dbms_target_link_libraries (
@@ -394,7 +506,6 @@ dbms_target_link_libraries (
         clickhouse_parsers
         ch_contrib::lz4
         Poco::JSON
-        string_utils
     PUBLIC
         boost::system
         clickhouse_common_io
@@ -425,6 +536,10 @@ dbms_target_link_libraries(PRIVATE ch_contrib::zstd)
 target_link_libraries (clickhouse_common_io PUBLIC ch_contrib::zstd)
 target_link_libraries (clickhouse_common_io PUBLIC ch_contrib::xz)
 
+if (TARGET ch_contrib::pocketfft)
+    target_link_libraries(clickhouse_common_io PUBLIC ch_contrib::pocketfft)
+endif ()
+
 if (TARGET ch_contrib::icu)
     dbms_target_link_libraries (PRIVATE ch_contrib::icu)
 endif ()
@@ -451,6 +566,7 @@ endif ()
 
 if (TARGET ch_contrib::ldap)
     dbms_target_link_libraries (PRIVATE ch_contrib::ldap ch_contrib::lber)
+    target_link_libraries (clickhouse_compression PRIVATE ch_contrib::ldap ch_contrib::lber)
 endif ()
 dbms_target_link_libraries (PUBLIC ch_contrib::sparsehash)
 
@@ -476,11 +592,16 @@ if (TARGET ch_contrib::aws_s3)
 endif()
 
 if (TARGET ch_contrib::azure_sdk)
+    target_link_libraries (clickhouse_common_io PUBLIC ch_contrib::azure_sdk)
     dbms_target_link_libraries (PRIVATE ch_contrib::azure_sdk)
 endif()
 
 if (TARGET ch_contrib::s2)
     dbms_target_link_libraries (PUBLIC ch_contrib::s2)
+endif()
+
+if (TARGET ch_contrib::vectorscan)
+    dbms_target_link_libraries (PRIVATE ch_contrib::vectorscan)
 endif()
 
 if (TARGET ch_contrib::brotli)
@@ -519,6 +640,12 @@ if (USE_ORC)
     dbms_target_include_directories(SYSTEM BEFORE PUBLIC ${ORC_INCLUDE_DIR} "${PROJECT_BINARY_DIR}/contrib/orc/c++/include")
 endif ()
 
+if (USE_UTF8PROC)
+    dbms_target_link_libraries(PUBLIC ch_contrib::utf8proc)
+    target_include_directories (clickhouse_common_io SYSTEM BEFORE PUBLIC ${UTF8PROC_INCLUDE_DIR})
+    message(STATUS "UTF8PROC_INCLUDE_DIR: ${UTF8PROC_INCLUDE_DIR}")
+endif()
+
 if (TARGET ch_contrib::rocksdb)
     dbms_target_link_libraries(PUBLIC ch_contrib::rocksdb)
 endif()
@@ -534,11 +661,16 @@ endif ()
 target_link_libraries (clickhouse_common_io PRIVATE ch_contrib::lz4)
 
 if (TARGET ch_contrib::qpl)
-dbms_target_link_libraries(PUBLIC ch_contrib::qpl)
+    dbms_target_link_libraries(PUBLIC ch_contrib::qpl)
 endif ()
 
 if (TARGET ch_contrib::accel-config)
     dbms_target_link_libraries(PUBLIC ch_contrib::accel-config)
+endif ()
+
+if (TARGET ch_contrib::qatzstd_plugin)
+    dbms_target_link_libraries(PUBLIC ch_contrib::qatzstd_plugin)
+    target_link_libraries(clickhouse_common_io PUBLIC ch_contrib::qatzstd_plugin)
 endif ()
 
 target_link_libraries(clickhouse_common_io PUBLIC boost::context)
@@ -589,8 +721,6 @@ if (TARGET ch_rust::skim)
     dbms_target_link_libraries(PUBLIC ch_rust::skim)
 endif()
 
-include ("${ClickHouse_SOURCE_DIR}/cmake/add_check.cmake")
-
 if (ENABLE_TESTS)
     macro (grep_gtest_sources BASE_DIR DST_VAR)
         # Cold match files that are not in tests/ directories
@@ -616,7 +746,6 @@ if (ENABLE_TESTS)
         dbms
         clickhouse_common_config
         clickhouse_common_zookeeper
-        string_utils
         hilite_comparator)
 
     if (TARGET ch_contrib::simdjson)
@@ -634,6 +763,4 @@ if (ENABLE_TESTS)
     if (TARGET ch_contrib::parquet)
         target_link_libraries(unit_tests_dbms PRIVATE ch_contrib::parquet)
     endif()
-
-    add_check(unit_tests_dbms)
 endif ()

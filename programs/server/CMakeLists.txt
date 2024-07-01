@@ -35,7 +35,6 @@ set (CLICKHOUSE_SERVER_LINK
         clickhouse_parsers
         clickhouse_storages_system
         clickhouse_table_functions
-        string_utils
 
     ${LINK_RESOURCE_LIB}
 

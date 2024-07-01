@@ -3,11 +3,13 @@
 #include <memory>
 #include <Columns/ColumnFixedString.h>
 #include <DataTypes/DataTypeFixedString.h>
+#include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <Functions/FunctionFactory.h>
 #include <IO/Operators.h>
 #include <Interpreters/Aggregator.h>
 #include <Interpreters/Context.h>
+#include <Interpreters/ExpressionActions.h>
 #include <Processors/Merges/AggregatingSortedTransform.h>
 #include <Processors/Merges/FinishAggregatingInOrderTransform.h>
 #include <Processors/QueryPlan/AggregatingStep.h>
@@ -21,6 +23,7 @@
 #include <Processors/Transforms/MergingAggregatedMemoryEfficientTransform.h>
 #include <QueryPipeline/QueryPipelineBuilder.h>
 #include <Common/JSONBuilder.h>
+#include <Common/Logger.h>
 
 namespace DB
 {
@@ -190,20 +193,24 @@ void AggregatingStep::transformPipeline(QueryPipelineBuilder & pipeline, const B
         const size_t streams = pipeline.getNumStreams();
 
         auto input_header = pipeline.getHeader();
-        pipeline.transform([&](OutputPortRawPtrs ports)
+
+        if (grouping_sets_size > 1)
         {
-            Processors copiers;
-            copiers.reserve(ports.size());
-
-            for (auto * port : ports)
+            pipeline.transform([&](OutputPortRawPtrs ports)
             {
-                auto copier = std::make_shared<CopyTransform>(input_header, grouping_sets_size);
-                connect(*port, copier->getInputPort());
-                copiers.push_back(copier);
-            }
+                Processors copiers;
+                copiers.reserve(ports.size());
 
-            return copiers;
-        });
+                for (auto * port : ports)
+                {
+                    auto copier = std::make_shared<CopyTransform>(input_header, grouping_sets_size);
+                    connect(*port, copier->getInputPort());
+                    copiers.push_back(copier);
+                }
+
+                return copiers;
+            });
+        }
 
         pipeline.transform([&](OutputPortRawPtrs ports)
         {
@@ -231,7 +238,10 @@ void AggregatingStep::transformPipeline(QueryPipelineBuilder & pipeline, const B
                     transform_params->params.enable_prefetch,
                     /* only_merge */ false,
                     transform_params->params.optimize_group_by_constant_keys,
-                    transform_params->params.stats_collecting_params};
+                    transform_params->params.min_hit_rate_to_use_consecutive_keys_optimization,
+                    transform_params->params.stats_collecting_params,
+                };
+
                 auto transform_params_for_set = std::make_shared<AggregatingTransformParams>(src_header, std::move(params_for_set), final);
 
                 if (streams > 1)
@@ -448,12 +458,33 @@ void AggregatingStep::transformPipeline(QueryPipelineBuilder & pipeline, const B
     /// If there are several sources, then we perform parallel aggregation
     if (pipeline.getNumStreams() > 1)
     {
+        auto stream_count = pipeline.getNumStreams();
+        /// Calculate the stream count by adding up all the stream aggregate functions costs.
+        /// the max stream count is the number of pipeline streams.
+        size_t estimate_stream = 0;
+        size_t agg_col_cost = 0;
+        size_t group_by_keys_cost = 0;
+        for (const auto & agg : params.aggregates)
+        {
+            /// get the function count by counting "("
+            agg_col_cost += static_cast<size_t>(std::count(agg.column_name.begin(), agg.column_name.end(), '('));
+            /// get the column count by counting "," + 1
+            agg_col_cost += 1 + static_cast<size_t>(std::count(agg.column_name.begin(), agg.column_name.end(), ','));
+        }
+        for (const auto & key : params.keys)
+        {
+            group_by_keys_cost += 1 + 8 * static_cast<size_t>(std::log2(key.size() + 1));
+        }
+        estimate_stream = std::min(stream_count, std::max(4ul, 2 * (agg_col_cost + group_by_keys_cost)));
+
+        LOG_TRACE(getLogger("AggregatingStep"), "AggregatingStep: estimate_stream = {}", estimate_stream);
+
         /// Add resize transform to uniformly distribute data between aggregating streams.
         /// But not if we execute aggregation over partitioned data in which case data streams shouldn't be mixed.
         if (!storage_has_evenly_distributed_read && !skip_merging)
-            pipeline.resize(pipeline.getNumStreams(), true, true);
+            pipeline.resize(estimate_stream, true, true);
 
-        auto many_data = std::make_shared<ManyAggregatedData>(pipeline.getNumStreams());
+        auto many_data = std::make_shared<ManyAggregatedData>(estimate_stream);
 
         size_t counter = 0;
         pipeline.addSimpleTransform(
@@ -470,7 +501,7 @@ void AggregatingStep::transformPipeline(QueryPipelineBuilder & pipeline, const B
                     skip_merging);
             });
 
-        pipeline.resize(should_produce_results_in_order_of_bucket_number ? 1 : params.max_threads, true /* force */);
+        pipeline.resize(should_produce_results_in_order_of_bucket_number ? 1 : estimate_stream, true /* force */);
 
         aggregating = collector.detachProcessors(0);
     }
